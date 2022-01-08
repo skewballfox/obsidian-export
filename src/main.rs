@@ -1,6 +1,6 @@
 use eyre::{eyre, Result};
 use gumdrop::Options;
-use obsidian_export::postprocessors::softbreaks_to_hardbreaks;
+use obsidian_export::postprocessors::{create_yaml_includer, softbreaks_to_hardbreaks};
 use obsidian_export::{ExportError, Exporter, FrontmatterStrategy, WalkOptions};
 use std::{env, path::PathBuf};
 
@@ -54,6 +54,21 @@ struct Opts {
         default = "false"
     )]
     hard_linebreaks: bool,
+
+    #[options(
+        no_short,
+        long = "front-matter-inclusion-key",
+        help = "Only include files with the specified YAML key set to 'true'"
+    )]
+    front_matter_inclusion: String,
+
+    #[options(
+        no_short,
+        long = "exclude-embeds-by-frontmatter",
+        help = "Exclude all embeds that do not have the front-matter-inclusion-key",
+        default = "false"
+    )]
+    embeded_front_matter_inclusion: bool,
 }
 
 fn frontmatter_strategy_from_str(input: &str) -> Result<FrontmatterStrategy> {
@@ -89,6 +104,19 @@ fn main() {
     exporter.frontmatter_strategy(args.frontmatter_strategy);
     exporter.process_embeds_recursively(!args.no_recursive_embeds);
     exporter.walk_options(walk_options);
+
+    // Here we call create_yaml_includer() with the user-supplied frontmatter inclusion key.
+    //
+    // Calling this function returns a closure which matches the signature of a postprocessor,
+    // meaning we can pass the result to add_postprocessor() later.
+    let yaml_postprocessor = create_yaml_includer(&args.front_matter_inclusion);
+
+    if args.front_matter_inclusion.len() > 0 {
+        exporter.add_postprocessor(&yaml_postprocessor);
+        if args.embeded_front_matter_inclusion {
+            exporter.add_embed_postprocessor(&yaml_postprocessor);
+        }
+    }
 
     if args.hard_linebreaks {
         exporter.add_postprocessor(&softbreaks_to_hardbreaks);
