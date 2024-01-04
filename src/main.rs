@@ -24,6 +24,13 @@ struct Opts {
     start_at: Option<PathBuf>,
 
     #[options(
+        no_short,
+        help = "Specify the recursion limit for link resolution outside of start-at",
+        default = "0"
+    )]
+    link_resolution_depth: usize,
+
+    #[options(
         help = "Frontmatter strategy (one of: always, never, auto)",
         no_short,
         long = "frontmatter",
@@ -107,6 +114,8 @@ fn main() {
         exporter.start_at(path);
     }
 
+    let link_resolution_depth = args.link_resolution_depth;
+    exporter.recusion_depth(link_resolution_depth);
     if let Err(err) = exporter.run() {
         match err {
             ExportError::FileExportError {

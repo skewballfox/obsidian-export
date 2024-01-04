@@ -12,6 +12,7 @@ mod walker;
 
 pub use context::Context;
 pub use frontmatter::{Frontmatter, FrontmatterStrategy};
+use rayon::iter::ParallelIterator;
 pub use walker::{vault_contents, WalkOptions};
 
 use frontmatter::{frontmatter_from_str, frontmatter_to_str};
@@ -23,6 +24,7 @@ use rayon::prelude::*;
 use references::*;
 use slug::slugify;
 use snafu::{ResultExt, Snafu};
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File};
@@ -31,7 +33,6 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::str;
 use unicode_normalization::UnicodeNormalization;
-
 /// A series of markdown [Event]s that are generated while traversing an Obsidian markdown note.
 pub type MarkdownEvents<'a> = Vec<Event<'a>>;
 
@@ -233,6 +234,7 @@ pub struct Exporter<'a> {
     process_embeds_recursively: bool,
     postprocessors: Vec<&'a Postprocessor<'a>>,
     embed_postprocessors: Vec<&'a Postprocessor<'a>>,
+    recursion_depth: usize,
 }
 
 impl<'a> fmt::Debug for Exporter<'a> {
@@ -257,7 +259,9 @@ impl<'a> fmt::Debug for Exporter<'a> {
                     "<{} postprocessors active>",
                     self.embed_postprocessors.len()
                 ),
-            )
+            ).field(
+                "start_at recursion_depth",
+                &self.recursion_depth)
             .finish()
     }
 }
@@ -276,6 +280,7 @@ impl<'a> Exporter<'a> {
             vault_contents: None,
             postprocessors: vec![],
             embed_postprocessors: vec![],
+            recursion_depth: 0,
         }
     }
 
@@ -284,7 +289,18 @@ impl<'a> Exporter<'a> {
     /// Normally all notes under `root` (except for notes excluded by ignore rules) will be exported.
     /// When `start_at` is set, only notes under this path will be exported to the target destination.
     pub fn start_at(&mut self, start_at: PathBuf) -> &mut Exporter<'a> {
+        //if start_at is an absolute path, join simpy returns start_at
         self.start_at = start_at;
+        self
+    }
+    /// Set the recursion depth for the export.
+    /// 
+    /// This only makes sense when start_at is set.
+    /// it effects how many linked files within the vault but outside 
+    /// of the start_at path are exported.
+    /// the path of these files are changed to be within the start_at path.
+    pub fn recusion_depth(&mut self, recusion_depth: usize) -> &mut Exporter<'a> {
+        self.recursion_depth = recusion_depth;
         self
     }
 
@@ -332,11 +348,17 @@ impl<'a> Exporter<'a> {
                 path: self.root.clone(),
             });
         }
+        if !self.start_at.exists() {
+            return Err(ExportError::PathDoesNotExist {
+                path: self.start_at.clone(),
+            });
+        }
 
         self.vault_contents = Some(vault_contents(
             self.root.as_path(),
             self.walk_options.clone(),
         )?);
+
 
         // When a single file is specified, just need to export that specific file instead of
         // iterating over all discovered files. This also allows us to accept destination as either
@@ -362,7 +384,7 @@ impl<'a> Exporter<'a> {
                     self.destination.clone()
                 }
             };
-            return self.export_note(&self.start_at, &destination);
+            return self.export_note(&self.start_at, &destination,None);
         }
 
         if !self.destination.exists() {
@@ -370,35 +392,141 @@ impl<'a> Exporter<'a> {
                 path: self.destination.clone(),
             });
         }
-        self.vault_contents
+        
+        let mut base_path = self.start_at.clone();
+        let mut content_to_parse = self
+            .vault_contents
             .as_ref()
             .unwrap()
             .clone()
-            .into_par_iter()
-            .filter(|file| file.starts_with(&self.start_at))
-            .try_for_each(|file| {
-                let relative_path = file
-                    .strip_prefix(&self.start_at.clone())
-                    .expect("file should always be nested under root")
-                    .to_path_buf();
-                let destination = &self.destination.join(relative_path);
-                self.export_note(&file, destination)
-            })?;
+            .into_par_iter();
+        if self.start_at == self.root {
+            self.full_export(base_path.as_path(),content_to_parse)?;
+            return Ok(());
+            
+        }
+        content_to_parse=content_to_parse.filter(|file| file.starts_with(&self.start_at)).collect::<Vec<PathBuf>>().into_par_iter();
+        let mut parsed_files = BTreeSet::new();
+        
+        //Range syntax is exclusive on the right side, so 
+        //we need to add 1 to the recursion_depth
+        //Also, tried to do this as an iterator, but the need to break
+        //once the set difference is empty made iteration difficult
+        for x in (0..(self.recursion_depth+1)).rev() {
+        
+                match x {
+                    0 => {
+                        self.full_export(base_path.as_path(),content_to_parse.clone())?;
+                    
+                    },
+                    _ => {
+                        
+                        let next_links=self.linked_export(base_path.as_path(), content_to_parse.clone())?;
+                        //check if there are any new links returned
+                        if next_links.is_empty(){
+                            break;
+                        }
+                        //add the new links to the parsed_files set and collect all links not yet parsed
+                        parsed_files.par_extend(content_to_parse.clone());
+                        let next_links=next_links.difference(&parsed_files)
+                        .cloned()
+                        .collect::<Vec<PathBuf>>();
+                        if next_links.is_empty(){
+                            break;
+                        }
+
+                        content_to_parse=next_links.into_par_iter();
+                    
+                    },
+            
+            
+            
+                };
+        
+                //Only first iteration should strip the start_at path
+                //all other iterations should strip the root path
+                if base_path==self.start_at {
+                        base_path=self.root.clone();
+                };
+                
+                };
         Ok(())
     }
 
-    fn export_note(&self, src: &Path, dest: &Path) -> Result<()> {
+    /// Exports but doesn't gather links for another iteration of parsing
+    /// Used when either start_at is the root, recursion_depth is 0, or on
+    /// the last iteration of link resolution
+    fn full_export(
+        &mut self,
+        base_path: &Path,
+        content_to_parse: rayon::vec::IntoIter<PathBuf>,
+    ) -> Result<(),ExportError> {
+        
+        
+        content_to_parse.try_for_each(|file| {
+                let relative_path = file
+                    .strip_prefix(base_path)
+                    .expect("file should always be nested under root")
+                    .to_path_buf();
+                
+                let destination = &self.destination.join(relative_path);
+                self.export_note(&file, destination,None)
+            })
+    }
+
+    /// Exports and gathers links for another iteration of parsing
+    /// File Links are stored in a BTreeSet to easily filter out duplicates
+    fn linked_export(
+        &mut self,
+        base_path: &Path,
+        content_to_parse: rayon::vec::IntoIter<PathBuf>,
+        
+    ) -> Result<BTreeSet<PathBuf>, ExportError> {
+        content_to_parse
+            .try_fold(
+                BTreeSet::new,
+                |mut acc, file| {
+                    let relative_path = file
+                        .strip_prefix(base_path)
+                        .expect("file should always be nested under root")
+                        .to_path_buf();
+                    let destination = &self.destination.join(relative_path);
+                    self.export_note(&file, destination, Some(&mut acc))?;
+                    Ok(acc)
+                },
+            )
+            .try_reduce(
+                BTreeSet::new,
+                |mut acc1, mut acc2| {acc1.append(&mut acc2);Ok(acc1)},
+            )
+
+        
+    }
+
+    fn export_note(
+        &self,
+        src: &Path,
+        dest: &Path,
+        linked_notes: Option<&mut BTreeSet<PathBuf>>,
+    ) -> Result<()> {
+        // self.recursion_depth>0;
         match is_markdown_file(src) {
-            true => self.parse_and_export_obsidian_note(src, dest),
+            true => self.parse_and_export_obsidian_note(src, dest, linked_notes),
             false => copy_file(src, dest),
         }
         .context(FileExportSnafu { path: src })
     }
 
-    fn parse_and_export_obsidian_note(&self, src: &Path, dest: &Path) -> Result<()> {
+    fn parse_and_export_obsidian_note(
+        &self,
+        src: &Path,
+        dest: &Path,
+        linked_files: Option<&mut BTreeSet<PathBuf>>,
+    ) -> Result<()> {
         let mut context = Context::new(src.to_path_buf(), dest.to_path_buf());
 
-        let (frontmatter, mut markdown_events) = self.parse_obsidian_note(src, &context)?;
+        let (frontmatter, mut markdown_events) =
+            self.parse_obsidian_note(src, &context, linked_files)?;
         context.frontmatter = frontmatter;
         for func in &self.postprocessors {
             match func(&mut context, &mut markdown_events) {
@@ -407,7 +535,8 @@ impl<'a> Exporter<'a> {
                 PostprocessorResult::Continue => (),
             }
         }
-
+        
+        
         let dest = context.destination;
         let mut outfile = create_file(&dest)?;
         let write_frontmatter = match self.frontmatter_strategy {
@@ -433,6 +562,7 @@ impl<'a> Exporter<'a> {
         &self,
         path: &Path,
         context: &Context,
+        mut linked_notes: Option<&mut BTreeSet<PathBuf>>,
     ) -> Result<(Frontmatter, MarkdownEvents<'b>)> {
         if context.note_depth() > NOTE_RECURSION_LIMIT {
             return Err(ExportError::RecursionLimitExceeded {
@@ -455,7 +585,7 @@ impl<'a> Exporter<'a> {
         let mut events = vec![];
         // Most of the time, a reference triggers 5 events: [ or ![, [, <text>, ], ]
         let mut buffer = Vec::with_capacity(5);
-
+        
         for event in Parser::new_ext(&content, parser_options) {
             if ref_parser.state == RefParserState::Resetting {
                 events.append(&mut buffer);
@@ -514,12 +644,18 @@ impl<'a> Exporter<'a> {
                 RefParserState::ExpectFinalCloseBracket => match event {
                     Event::Text(CowStr::Borrowed("]")) => match ref_parser.ref_type {
                         Some(RefType::Link) => {
+                            let linked_note = ObsidianNoteReference::from_str(
+                                ref_parser.ref_text.as_ref(),
+                            );
+                            if let (Some(linked_files), Some(file)) = (linked_notes.as_deref_mut(), linked_note.file) {
+                                linked_files.insert(PathBuf::from(file));
+                            }
                             let mut elements = self.make_link_to_file(
-                                ObsidianNoteReference::from_str(
-                                    ref_parser.ref_text.clone().as_ref()
-                                ),
+                                linked_note,
                                 context,
                             );
+                            
+                            
                             events.append(&mut elements);
                             buffer.clear();
                             ref_parser.transition(RefParserState::Resetting);
@@ -598,7 +734,9 @@ impl<'a> Exporter<'a> {
 
         let events = match path.extension().unwrap_or(&no_ext).to_str() {
             Some("md") => {
-                let (frontmatter, mut events) = self.parse_obsidian_note(path, &child_context)?;
+                //let's just assume for now that the embedded text doesn't link somewhere else
+                //TODO: fix this
+                let (frontmatter, mut events) = self.parse_obsidian_note(path, &child_context,None)?;
                 child_context.frontmatter = frontmatter;
                 if let Some(section) = note_ref.section {
                     events = reduce_to_section(events, section);
